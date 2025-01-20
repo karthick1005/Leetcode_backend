@@ -31,6 +31,7 @@ router.post("/submit", async (req, res) => {
             //         .replace(/\\'/g, "'")       // Convert escaped single quotes if necessary
             //         .replace(/^\r\n' \+|'\r\n' \+|\r\n'$/gm, "");
             // }
+
             totalcode = atob(value.Remaining[req.body.lang]).replace("// INSERT_CODE_HERE", req.body.src).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"');
             console.log("this is total code")
             console.log(totalcode)

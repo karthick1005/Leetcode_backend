@@ -233,7 +233,7 @@ if (recievebody) {
             }
         }
         // await deleteFolder(`../temp/${apiBody.folder}`);// Ensure this is awaited
-        setInterval(() => { }, 1000);
+        // setInterval(() => { }, 1000);
         let json = { status: breaked, data: ans, testcase: testcase, Accepted: overallcase }
         console.log('Data to returned back:', JSON.stringify(json));
 
