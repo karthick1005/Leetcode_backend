@@ -37,9 +37,10 @@ const runcommand = async (apiBody, testcase) => {
     const data = await fs.promises.readFile(`/temp/${apiBody.folder}/outputuser.txt`, "utf-8");
     const dataadmin = await fs.promises.readFile(`/temp/${apiBody.folder}/outputadmin.txt`, "utf-8");
     console.log(dataadmin)
-    // console.log(data)
+    let std = data.split("\n").splice(0, data.split("\n").length - 1);
     let result = {
-        output: data.replace("\n", ""),
+        output: std.at(-1) || null,
+        stdout: std.splice(0, std.length - 1).slice(0, 8333),
         input: testcase.split("\n"),
         stderr: outputu.stderr,
         status: outputu.stdout,
@@ -111,81 +112,6 @@ function processTestCases(input, numInputsPerTestCase) {
 
 
 
-// Function to format code based on language
-async function formatCode(code, language) {
-    let formattedCode;
-    try {
-        switch (language) {
-            case "cpp":
-            case "c":
-                // C/C++ formatting using prettier-plugin-c
-                formattedCode = await formatWithClang(code, language);
-                break;
-            case "java":
-                // Java formatting using external tool
-                formattedCode = await formatJavaWithExternalTool(code);
-                break;
-            case "python3":
-                // Python formatting using Prettier
-                formattedCode = prettier.format(code, { parser: "python" });
-                break;
-            case "javascript":
-                // JavaScript formatting using Prettier
-                formattedCode = await prettier.format(code, { parser: "babel" });
-                break;
-            case "csharp":
-                // C# formatting using external tool
-                formattedCode = await formatCSharpWithExternalTool(code);
-                break;
-            default:
-                console.log("Unsupported language.");
-                return null;
-        }
-        return formattedCode;
-    } catch (error) {
-        console.error("Error formatting code:", error);
-        return null;
-    }
-}
-async function formatWithClang(code, language) {
-    return new Promise((resolve, reject) => {
-        const process = exec('clang-format', (error, stdout, stderr) => {
-            if (error) {
-                return reject(error);
-            }
-            resolve(stdout); // Return formatted code
-        });
-        process.stdin.write(code); // Send code to the process
-        process.stdin.end();
-    });
-}
-// External tool to format Java using google-java-format
-async function formatJavaWithExternalTool(code) {
-    return new Promise((resolve, reject) => {
-        const process = exec("google-java-format --replace -", (error, stdout, stderr) => {
-            if (error) {
-                return reject(error);
-            }
-            resolve(stdout); // Return formatted code
-        });
-        process.stdin.write(code); // Send code to the process
-        process.stdin.end();
-    });
-}
-
-// External tool to format C# using dotnet format
-async function formatCSharpWithExternalTool(code) {
-    return new Promise((resolve, reject) => {
-        const process = exec("dotnet format", (error, stdout, stderr) => {
-            if (error) {
-                return reject(error);
-            }
-            resolve(stdout); // Return formatted code
-        });
-        process.stdin.write(code); // Send code to the process
-        process.stdin.end();
-    });
-}
 
 
 
@@ -210,10 +136,13 @@ if (recievebody) {
         let breaked = false;
         console.log(testcase)
         let overallcase = true
+        let startTime = performance.now();
+        let endTime = performance.now();
+        let error = false
         for (let i = 0; i < testcase.length; i++) {
 
             await fs.promises.writeFile(`/temp/${apiBody.folder}/input.txt`, testcase[i]);
-
+            startTime = Math.max(endTime, performance.now());
             const result = await runcommand(apiBody, testcase[i]);
             result.testcasestatus = (result.output === result.Expected)
             if (!result.testcasestatus && overallcase) {
@@ -221,10 +150,17 @@ if (recievebody) {
             }
             ans.push(result);
             console.log(result)
+            endTime = Math.max(endTime, performance.now());
             if (result.stderr != '') {
                 breaked = true;
+                error = "Runtime Error"
                 break;
 
+            }
+            else if (result.status === "timeout\n") {
+                breaked = true;
+                error = "TImelimit Exceeded"
+                break;
             }
             if (apiBody.testcase && result.output !== result.Expected) {
                 breaked = true;
@@ -232,9 +168,11 @@ if (recievebody) {
                 break;
             }
         }
+
         // await deleteFolder(`../temp/${apiBody.folder}`);// Ensure this is awaited
         // setInterval(() => { }, 1000);
-        let json = { status: breaked, data: ans, testcase: testcase, Accepted: overallcase }
+        let json = { status: breaked, data: ans, testcase: testcase, Accepted: overallcase, runtime: endTime - startTime, error }
+        console.log(json)
         console.log('Data to returned back:', JSON.stringify(json));
 
     } catch (error) {

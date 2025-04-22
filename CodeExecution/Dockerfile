@@ -51,7 +51,7 @@ RUN apk update && \
     apk add --no-cache nodejs npm 
 
 RUN apk add --no-cache build-base wget
-
+RUN apk add coreutils
 # Download Python 2 source
 RUN wget https://www.python.org/ftp/python/2.7.18/Python-2.7.18.tgz && \
     tar -xzf Python-2.7.18.tgz && \

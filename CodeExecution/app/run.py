@@ -55,6 +55,19 @@ def run(file, input, timeout, lang):
 
     r = os.system(f'timeout {timeout} {cmd} < {input} > {testout}')
     return {0: 200, 31744: 408}.get(r, 400)
+    # try:
+    #     with open(input, "r") as infile, open(testout, "w") as outfile:
+    #         # Run the command with timeout
+    #         subprocess.run(cmd, stdin=infile, stdout=outfile, stderr=subprocess.PIPE, shell=True, timeout=int(timeout))
+    #     return 200  # Success
+    # except subprocess.TimeoutExpired:
+    #     return 408  # Timeout
+    # except subprocess.CalledProcessError as e:
+    #     print(f"Command failed with error: {e}")
+    #     return 400
+    # except Exception as e:
+    #     print(f"Error: {e}")
+    #     return 400  # General Error
 
 def match(output):
     if os.path.isfile('out.txt') and os.path.isfile(output):

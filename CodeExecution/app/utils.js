@@ -24,6 +24,7 @@ export const execute = (command) => {
                 reject(err);
             } else {
                 let status = { stdout: stdout, stderr: stderr };
+                console.log(status)
                 resolve(status);
             }
         })

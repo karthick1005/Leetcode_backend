@@ -32,12 +32,12 @@ router.post("/submit", async (req, res) => {
             //         .replace(/^\r\n' \+|'\r\n' \+|\r\n'$/gm, "");
             // }
 
-            totalcode = atob(value.Remaining[req.body.lang]).replace("// INSERT_CODE_HERE", req.body.src).replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"');
+            totalcode = atob(value.Remaining[req.body.lang]).replace("// INSERT_CODE_HERE", req.body.src)
             console.log("this is total code")
             console.log(totalcode)
             let data = {
                 'src': totalcode,
-                'input': req.body.stdin,
+                'input': req.body.testcase ? value.Testcases : req.body.stdin,
                 'lang': req.body.lang,
                 'timeOut': value.Timeout,
                 "testcase": req.body.testcase,
