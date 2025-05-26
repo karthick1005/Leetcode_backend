@@ -1,7 +1,7 @@
 version: "2.3" #Use this version strictly
 services:
   rabbitmq:
-    image: "rabbitmq"
+    image: "rabbitmq:3.10"
     restart: always
   redis-server:
     image: "redis"
@@ -10,7 +10,7 @@ services:
     build: ./server
     restart: always
     ports:
-      - "7000:7000"
+      - "9000:7000"
   worker:
     build: ./workers
     restart: always

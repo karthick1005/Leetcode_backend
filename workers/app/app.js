@@ -13,6 +13,7 @@ const extensions = {
 };
 
 const runCode = async (apiBody, ch, msg) => {
+    let containers;
     try {
         client.set(apiBody.folder.toString(), 'Processing');
         const myObjectString = JSON.stringify(apiBody);
@@ -22,26 +23,14 @@ const runCode = async (apiBody, ch, msg) => {
             Tty: true, // Enable TTY if needed
             HostConfig: {
 
-                AutoRemove: true,
+                // AutoRemove: true,
             },
         };
         console.log("hello")
-        // docker.createContainer(containerConfig)
-        //     .then(container => {
-        //         console.log('Container created:', container.id);
-
-        //         // Start the container
-        //         return container.start();
-        //     })
-        //     .then(container => {
-        //         console.log('Container started:', container.id);
-        //     })
-        //     .catch(err => {
-        //         console.error('Error:', err);
-        //     });
 
         docker.createContainer(containerConfig)
             .then(container => {
+                containers=container
                 console.log('Container created:', container.id);
                 return container.start()
                     .then(() => {
@@ -68,6 +57,9 @@ const runCode = async (apiBody, ch, msg) => {
                             });
                         });
                     });
+            })
+            .then(output => {
+                return containers.remove().then(() => output); // 🧹 Clean up
             })
             .then((output) => {
                 // Parse the output to extract the desired data
