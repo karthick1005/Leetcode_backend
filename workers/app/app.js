@@ -99,7 +99,7 @@ const runCode = async (apiBody, ch, msg) => {
     // 8️⃣ Cleanup container safely
     if (container) {
       try {
-        await container.remove({ force: true });
+        // await container.remove({ force: true });
         console.log("Container removed:", container.id);
       } catch (cleanupErr) {
         console.error("Failed to cleanup container:", cleanupErr.message);
