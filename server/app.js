@@ -8,6 +8,9 @@ const app=express();
 app.use(cors())
 app.use(parser.urlencoded({ limit: "50mb", extended: true, parameterLimit: 50000 }))
 app.use(parser.json({limit: "50mb"}))
+app.get('/', (req, res) => {
+    res.send('Hello World!')
+});
 app.use(coreRoutes);
 
 const port = process.env.PORT || 7000;
