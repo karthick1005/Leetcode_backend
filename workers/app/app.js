@@ -4,120 +4,114 @@ import { deleteFolder, execute } from "./utils.js"
 import "./config/rabbitmq.js";
 import Dockerode from "dockerode";
 
-const docker = new Dockerode({ socketPath: '/var/run/docker.sock' });
-const extensions = {
-    cpp: "cpp",
-    c: "c",
-    java: "java",
-    python3: "txt",
-};
+const docker = new Dockerode({
+  socketPath: "/var/run/docker.sock",
+});
 
 const runCode = async (apiBody, ch, msg) => {
-    let containers;
-    try {
-        client.set(apiBody.folder.toString(), 'Processing');
-        const myObjectString = JSON.stringify(apiBody);
-        const containerConfig = {
-            Image: 'codeengine', // Replace with your Docker image name
-            Env: [`MY_OBJECT=${myObjectString}`], // Pass the object as an environment variable
-            Tty: true, // Enable TTY if needed
-            HostConfig: {
+  let container = null;
 
-                // AutoRemove: true,
-            },
-        };
-        console.log("hello")
+  try {
+    // Mark job as processing
+    await client.set(apiBody.folder.toString(), "Processing");
 
-        docker.createContainer(containerConfig)
-            .then(container => {
-                containers=container
-                console.log('Container created:', container.id);
-                return container.start()
-                    .then(() => {
-                        console.log('Container started:', container.id);
-                        // Wait for the container to finish
-                        return container.wait();
-                    })
-                    .then(() => {
-                        // Capture the container logs
-                        return new Promise((resolve, reject) => {
-                            let output = '';
-                            container.logs({
-                                follow: true,
-                                stdout: true,
-                                stderr: true
-                            }, (err, stream) => {
-                                if (err) return reject(err);
-                                stream.on('data', (chunk) => {
-                                    output += chunk.toString();
-                                });
-                                stream.on('end', () => {
-                                    resolve(output);
-                                });
-                            });
-                        });
-                    });
-            })
-            .then(output => {
-                return containers.remove().then(() => output); // 🧹 Clean up
-            })
-            .then((output) => {
-                // Parse the output to extract the desired data
-                const regex = /Data to returned back:\s*(\{[\s\S]*\})/; // Adjust the regex based on your output
-                const match = regex.exec(output);
-                console.log(match[1])
-                console.log("this is after")
-                if (match && match[1]) {
-                    let jsonData = match[1];
-                    // jsonData = jsonData
-                    //     .replace(/(\w+):/g, '"$1":')              // Wrap keys with double quotes
-                    //     .replace(/'/g, '"')                       // Replace single quotes with double quotes
-                    //     .replace(/,\s*}/g, '}')                   // Remove trailing commas before closing brace
-                    //     .replace(/,\s*]/g, ']');
-                    // jsonData = jsonData.replace(/\u001b\[\d+m/g, '')       // Remove ANSI escape codes
-                    //     .replace(/(\w+):/g, '"$1":')        // Wrap keys with double quotes
-                    //     .replace(/,\s*}/g, '}')              // Remove trailing commas before closing brace
-                    //     .replace(/,\s*]/g, ']')
-                    //     .replace(/:\s*(".*?")/g, ': $1') // Ensure proper spacing after colons
-                    //     .replace(/(\w+):/g, '"$1":')
-                    console.log(jsonData)
-                    jsonData = JSON.parse(jsonData)
-                    console.log('Data received from container:', jsonData);
-                    client.setex(apiBody.folder.toString(), 3600, JSON.stringify(jsonData));
-                } else {
-                    console.error('No data found in output.');
-                    client.setex(apiBody.folder.toString(), 3600, JSON.stringify({ error: "No data founds" }));
-                    // res.status(500).json({ error: 'No data found in container output.' });
-                }
-            })
-            .catch(err => {
-                console.error('Error:', err);
-                client.setex(apiBody.folder.toString(), 3600, JSON.stringify({ error: err }));
+    const myObjectString = JSON.stringify(apiBody);
 
-                // res.status(500).json({ error: 'Failed to run container.' });
-            });
-        // const command = `python3 run.py ../temp/${apiBody.folder}/source.${extensions[apiBody.lang]} ${apiBody.lang} ${apiBody.timeOut}`;
-        // await fs.promises.writeFile(`/temp/${apiBody.folder}/output.txt`, "");
-        // console.log("Output.txt created !")
+    const containerConfig = {
+      Image: "codeengine", // your execution image
+      Env: [`MY_OBJECT=${myObjectString}`],
+      Tty: false, // IMPORTANT: disable TTY for proper logs
+      HostConfig: {
+        AutoRemove: false, // keep container for debugging
+      },
+    };
 
-        // const output = await execute(command);
-        // const data = await fs.promises.readFile(`/temp/${apiBody.folder}/output.txt`, "utf-8");
-        // let result = {
-        //     output: data,
-        //     stderr: output.stderr,
-        //     status: output.stdout,
-        //     submission_id: apiBody.folder,
-        // };
+    console.log("Creating execution container...");
 
-        // console.log(result);
-        // deleteFolder(`../temp/${apiBody.folder}`);
+    // 1️⃣ Create container
+    container = await docker.createContainer(containerConfig);
+    console.log("Container created:", container.id);
 
-        ch.ack(msg);
-    } catch (error) {
-        console.log("Error")
+    // 2️⃣ Start container
+    await container.start();
+    console.log("Container started:", container.id);
+
+    // 3️⃣ Wait for execution to finish
+    const waitResult = await container.wait();
+    console.log("Container exited with code:", waitResult.StatusCode);
+
+    // 4️⃣ Read logs AFTER exit (CRITICAL)
+    const logsBuffer = await container.logs({
+      stdout: true,
+      stderr: true,
+    });
+
+    const output = logsBuffer.toString();
+    console.log("RAW CONTAINER OUTPUT:\n", output);
+
+    // 5️⃣ Validate output
+    if (!output || output.trim().length === 0) {
+      throw new Error("Execution container produced no output");
     }
 
-}
+    // 6️⃣ Extract result safely
+    const regex = /Data to returned back:\s*(\{[\s\S]*\})/;
+    const match = regex.exec(output);
+
+    if (!match || !match[1]) {
+      console.error("Output format mismatch");
+      console.error("FULL OUTPUT:", output);
+
+      await client.setex(
+        apiBody.folder.toString(),
+        3600,
+        JSON.stringify({
+          error: "Invalid container output",
+          raw: output,
+        })
+      );
+
+      return;
+    }
+
+    // 7️⃣ Parse result
+    const jsonData = JSON.parse(match[1]);
+    console.log("Parsed execution result:", jsonData);
+
+    await client.setex(
+      apiBody.folder.toString(),
+      3600,
+      JSON.stringify(jsonData)
+    );
+
+  } catch (err) {
+    console.error("Execution error:", err);
+
+    await client.setex(
+      apiBody.folder.toString(),
+      3600,
+      JSON.stringify({
+        error: err.message || "Execution failed",
+      })
+    );
+
+  } finally {
+    // 8️⃣ Cleanup container safely
+    if (container) {
+      try {
+        await container.remove({ force: true });
+        console.log("Container removed:", container.id);
+      } catch (cleanupErr) {
+        console.error("Failed to cleanup container:", cleanupErr.message);
+      }
+    }
+
+    // 9️⃣ Acknowledge RabbitMQ message
+    ch.ack(msg);
+  }
+};
+
+
 
 export const createFiles = async (apiBody, ch, msg) => {
     try {
