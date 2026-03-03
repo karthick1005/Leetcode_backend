@@ -13,7 +13,7 @@
   "dependencies": {
     "amqp-connection-manager": "^3.2.0",
     "amqplib": "^0.10.9",
-    "bail": "^1.0.5",
+    "bail": "^2.0.2",
     "dockerode": "^4.0.2",
     "nodemon": "^2.0.2",
     "redis": "^3.0.2",
