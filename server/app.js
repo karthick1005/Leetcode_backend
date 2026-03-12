@@ -162,7 +162,7 @@ app.post('/submit', async (req, res) => {
         // Decode admin code and remaining code
         adminCode = problemData.Adminsrc
         remainingCode = atob(problemData.Remaining[language] || '');
-        groupedTestcases=groupTestcases(testcases, problemData.Inputname.length || 1)
+        groupedTestcases=groupTestcases(testcases, problemData?.Inputname?.length || 1)
 
         console.log(`✅ Loaded admin code and remaining code for ${language}`);
       } else {

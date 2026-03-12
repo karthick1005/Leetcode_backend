@@ -66,12 +66,89 @@ function getCachedBinary(cacheKey) {
 }
 
 /**
+ * Extract user output from marked sections
+ * User code should wrap their output with __START_USER_OUTPUT__ and __END_USER_OUTPUT__ markers
+ * Example:
+ *   console.log('__START_USER_OUTPUT__');
+ *   const result = twoSum(nums, target);
+ *   console.log(`[${result[0]},${result[1]}]`);
+ *   console.log('__END_USER_OUTPUT__');
+ */
+function extractMarkedOutput(output) {
+  const startMarker = '__START_USER_OUTPUT__';
+  const endMarker = '__END_USER_OUTPUT__';
+  
+  const startIdx = output.indexOf(startMarker);
+  const endIdx = output.indexOf(endMarker);
+  
+  if (startIdx === -1 || endIdx === -1) {
+    // Markers not found, return all output
+    return output;
+  }
+  
+  // Extract content between markers (excluding the markers themselves)
+  const markedContent = output.substring(
+    startIdx + startMarker.length,
+    endIdx
+  ).trim();
+  
+  return markedContent;
+}
+
+function splitOutput(output) {
+  const startMarker = '__START_USER_OUTPUT__';
+  const endMarker = '__END_USER_OUTPUT__';
+
+  const startIdx = output.indexOf(startMarker);
+  const endIdx = output.indexOf(endMarker);
+
+  if (startIdx === -1 || endIdx === -1) {
+    return {
+      logs: "",
+      output: output.trim()
+    };
+  }
+
+  // logs = content inside markers
+  const logs = output.substring(
+    startIdx + startMarker.length,
+    endIdx
+  ).trim();
+
+  // output = everything outside markers
+  const outputWithoutMarkers =
+    output.slice(0, startIdx) +
+    output.slice(endIdx + endMarker.length);
+
+  return {
+    logs,
+    output: outputWithoutMarkers.trim()
+  };
+}
+/**
  * Cache compiled binary
  */
 function cacheBinary(cacheKey, binaryPath) {
   if (cacheKey) {
     compileCache.set(cacheKey, binaryPath);
   }
+}
+
+/**
+ * Extract first error line from stderr/stdout
+ */
+function extractFirstError(errorStr) {
+  if (!errorStr) return { short: '', full: '' };
+  
+  const lines = errorStr.split('\n').filter(l => l.trim());
+  
+  // Find first line with 'error' keyword
+  const errorLine = lines.find(l => l.toLowerCase().includes('error'));
+  
+  return {
+    short: errorLine ? errorLine.trim() : lines[0]?.trim() || 'Unknown error',
+    full: errorStr.trim()
+  };
 }
 
 // ============= CONTAINER EXECUTION =============
@@ -253,10 +330,21 @@ export async function executeCode(payload) {
 
           if (compileResult.stdout.includes('error')) {
             console.log(`[${submissionId}] ❌ Compilation error in container ${containerId}`);
+            const errorDetails = extractFirstError(compileResult.stdout || compileResult.stderr);
             return {
               status: 'Compilation Error',
+              status_code: -2,
+              lang: lang,
+              run_success: false,
+              status_msg: 'Compilation Error',
+              state: 'COMPILATION_ERROR',
+              compile_error: errorDetails.short,
+              full_compile_error: errorDetails.full,
               error: compileResult.stdout,
               testcases: [],
+              total_testcases: processedTestcases.length,
+              total_correct: 0,
+              submission_id: submissionId,
             };
           }
 
@@ -274,30 +362,62 @@ export async function executeCode(payload) {
           console.log(`[${submissionId}] 💾 Cached binary: ${binaryPath}`);
         } catch (error) {
           console.log(`[${submissionId}] ❌ Compilation failed in container ${containerId}: ${error.message}`);
+          const errorDetails = extractFirstError(error.message);
           return {
             status: 'Compilation Error',
+            status_code: -2,
+            lang: lang,
+            run_success: false,
+            status_msg: 'Compilation Error',
+            state: 'COMPILATION_ERROR',
+            compile_error: errorDetails.short,
+            full_compile_error: errorDetails.full,
             error: error.message,
             testcases: [],
+            total_testcases: processedTestcases.length,
+            total_correct: 0,
+            submission_id: submissionId,
           };
         }
       }
     }
 
-    // Step 3: Execute test cases in parallel
+    // Step 3: Execute test cases sequentially - stop on first runtime error
     console.log(`[${submissionId}] 🧪 Executing ${processedTestcases.length} test case(s) in container ${containerId}...`);
 
-    const executions = processedTestcases.map(async (testcase, index) => {
+    const results = [];
+    let shouldStop = false;
+
+    for (let index = 0; index < processedTestcases.length; index++) {
+      const testcase = processedTestcases[index];
+
+      // Stop execution if runtime error occurred in previous test
+      if (shouldStop) {
+        console.log(`[${submissionId}] ⏹️  Stopping execution due to runtime error in test case ${index}`);
+        // results.push({
+        //   input: '',
+        //   output: '',
+        //   expected: '',
+        //   passed: false,
+        //   status: 'Skipped',
+        //   error: 'Execution stopped due to runtime error in previous test case',
+        // });
+        continue;
+      }
+
       try {
         // Validate testcase has required fields
         if (!testcase || typeof testcase !== 'object') {
-          return {
+          results.push({
             input: '',
             output: '',
             expected: '',
             passed: false,
             status: 'Runtime Error',
             error: 'Invalid testcase format',
-          };
+          });
+          shouldStop = true;
+          continue;
         }
 
         // Ensure input and expected are strings
@@ -325,16 +445,31 @@ export async function executeCode(payload) {
           execTimeout
         );
 
-        const actualOutput = normalizeOutput(
-  Buffer.from(result.stdout).toString("utf8")
-);
-         expected=normalizeOutput(expected);
-        const passed = actualOutput === expected;
+        // Extract marked output (between __START_USER_OUTPUT__ and __END_USER_OUTPUT__)
+        const fullStdout = Buffer.from(result.stdout).toString("utf8");
+        console.log("this is error", result.stderr);
+        const { logs, output } = splitOutput(fullStdout);
+        
+        // Check for runtime errors (stderr)
+        let runtimeError = null;
+        if (result.stderr) {
+          const errorDetails = extractFirstError(result.stderr);
+          runtimeError = {
+            runtime_error: errorDetails.short,
+            full_runtime_error: errorDetails.full
+          };
+          console.log(`[${submissionId}] ⚠️  Runtime Error: ${errorDetails.short}`);
+          shouldStop = true; // Stop execution on runtime error
+        }
+        
+        const actualOutput = normalizeOutput(output);
+        expected = normalizeOutput(expected);
+        const passed = actualOutput === expected && !runtimeError;
        
         console.log("actual bytes:", [...actualOutput].map(c => c.charCodeAt(0)));
-console.log("expected bytes:", [...expected].map(c => c.charCodeAt(0)));
-        console.log("this is type of",typeof actualOutput, typeof expected,actualOutput, expected, actualOutput===expected);
-        const status = passed ? 'Passed' : 'Wrong Answer';
+        console.log("expected bytes:", [...expected].map(c => c.charCodeAt(0)));
+        console.log("this is type of", typeof actualOutput, typeof expected, actualOutput, expected, actualOutput === expected);
+        const status = runtimeError ? 'Runtime Error' : (passed ? 'Passed' : 'Wrong Answer');
         
         console.log(`[${submissionId}] ▶️  Command: cd ${execDir} && ${runCmd} < ${inputFile}`);
         console.log(`[${submissionId}] 📤 STDOUT: "${actualOutput}"`);
@@ -342,15 +477,17 @@ console.log("expected bytes:", [...expected].map(c => c.charCodeAt(0)));
           console.log(`[${submissionId}] 📥 STDERR: "${result.stderr.trim()}"`);
         }
         console.log(`[${submissionId}] 🎯 Expected: "${expected}"`);
-        console.log(`[${submissionId}] ${passed ? '✅' : '❌'} Test case ${index + 1}: ${status}`);
+        console.log(`[${submissionId}] ${passed && !runtimeError ? '✅' : '❌'} Test case ${index + 1}: ${status}`);
 
-        return {
+        results.push({
           input: input.substring(0, 100), // Truncate for display
           output: actualOutput,
           expected: expected,
           passed,
           status,
-        };
+          logs: logs, // Include logs for debugging
+          ...runtimeError, // Include runtime error if exists
+        });
       } catch (error) {
         // Safely get input from testcase
         let input = '';
@@ -361,48 +498,121 @@ console.log("expected bytes:", [...expected].map(c => c.charCodeAt(0)));
         }
         
         console.log(`[${submissionId}] ❌ Test case ${index + 1}: Runtime Error - ${error.message}`);
+        const errorDetails = extractFirstError(error.message);
         
-        return {
+        results.push({
           input: input,
           output: '',
           expected: expected,
           passed: false,
           status: 'Runtime Error',
           error: error.message,
-        };
+          runtime_error: errorDetails.short,
+          full_runtime_error: errorDetails.full,
+        });
+        
+        shouldStop = true; // Stop execution on runtime error
       }
-    });
-
-    const results = await Promise.all(executions);
+    }
 
     // Determine overall status
     const allPassed = results.every((r) => r.passed);
     const hasError = results.some((r) => r.status === 'Runtime Error');
     const hasWrongAnswer = results.some((r) => r.status === 'Wrong Answer');
 
-    let status = 'Accepted';
-    if (hasError) status = 'Runtime Error';
-    else if (hasWrongAnswer) status = 'Wrong Answer';
+    let statusMsg = 'Accepted';
+    if (hasError) statusMsg = 'Runtime Error';
+    else if (hasWrongAnswer) statusMsg = 'Wrong Answer';
 
-    const passed = results.filter((r) => r.passed).length;
+    // Extract first error if exists
+    const firstErrorResult = results.find((r) => r.runtime_error || r.full_runtime_error);
 
-    console.log(`[${submissionId}] 📊 Results: ${passed}/${results.length} passed - ${status}`);
-    console.log(`[${submissionId}] 🐳 Container ${containerId} completed execution`);
+    const totalCorrect = results.filter((r) => r.passed).length;
+    const totalTestcases = results.length;
+    const compareResult = results.map((r) => r.passed ? '1' : '0').join('');
 
-    return {
-      status,
-      passed,
-      total: results.length,
-      runtime: `${execTimeout}ms`,
-      memory: 'N/A', // Can be enhanced
+    const endTime = Date.now();
+    const elapsedTime = endTime - Date.now(); // In real scenario would be from start
+    const memoryKB = 42004000; // Placeholder
+    const statusMemory = Math.round(memoryKB / 1024 / 1024) + ' MB';
+
+    // LeetCode-style response format
+    const leetcodeResponse = {
+      // Required field: status (for server endpoint)
+      status: statusMsg,
+      
+      // User code execution details
+      status_code: hasError ? -1 : (allPassed ? 10 : 11), // 10=Accepted, 11=Wrong Answer, -1=Error
+      lang: lang,
+      run_success: !hasError,
+      status_runtime: hasError ? 'N/A' : '0 ms',
+      memory: memoryKB,
+      display_runtime: '0',
+      code_answer: results.map((r) => r.output),
+      code_output: [],
+      std_output_list: results.map((r) => r.logs),
+      elapsed_time: elapsedTime,
+      task_finish_time: endTime,
+      task_name: 'judger.runcodetask.RunCode',
+
+      // Error details (if any)
+      ...(firstErrorResult && {
+        runtime_error: firstErrorResult.runtime_error,
+        full_runtime_error: firstErrorResult.full_runtime_error,
+      }),
+
+      // Expected output (from admin code)
+      expected_status_code: 10, // Expected always runs successfully
+      expected_lang: 'python', // Admin code language
+      expected_run_success: true,
+      expected_status_runtime: '0 ms',
+      expected_memory: 12372000,
+      expected_display_runtime: '0',
+      expected_code_answer: results.map((r) => r.expected),
+      expected_code_output: [],
+      expected_std_output_list: results.map((r) => r.expected),
+      expected_elapsed_time: 36,
+      expected_task_finish_time: Date.now(),
+      expected_task_name: 'judger.interprettask.Interpret',
+
+      // Comparison results
+      correct_answer: allPassed,
+      compare_result: compareResult, // '111' = all passed, '101' = 2 passed 1 failed
+      total_correct: totalCorrect,
+      total_testcases: totalTestcases,
+      runtime_percentile: null,
+      status_memory: statusMemory,
+      memory_percentile: null,
+      pretty_lang: lang.charAt(0).toUpperCase() + lang.slice(1),
+      submission_id: submissionId,
+      status_msg: statusMsg,
+      state: allPassed ? 'SUCCESS' : (hasError ? 'RUNTIME_ERROR' : 'WRONG_ANSWER'),
+      
+      // Detailed results for debugging
       testcases: results,
     };
+
+    console.log(`[${submissionId}] 📊 Results: ${totalCorrect}/${totalTestcases} passed - ${statusMsg}`);
+    console.log(`[${submissionId}] 🐳 Container ${containerId} completed execution`);
+
+    return leetcodeResponse;
   } catch (error) {
     console.log(`[${submissionId}] ❌ System error in container ${containerId}: ${error.message}`);
+    const errorDetails = extractFirstError(error.message);
     return {
       status: 'System Error',
+      status_code: -1,
+      lang: lang,
+      run_success: false,
+      status_msg: 'System Error',
+      state: 'SYSTEM_ERROR',
+      compile_error: errorDetails.short,
+      full_compile_error: errorDetails.full,
       error: error.message,
       testcases: [],
+      total_testcases: 0,
+      total_correct: 0,
+      submission_id: submissionId,
     };
   } finally {
     // Return container to pool

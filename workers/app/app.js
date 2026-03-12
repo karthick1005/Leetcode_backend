@@ -31,16 +31,15 @@ async function updateSubmissionResult(submissionId, result) {
  * Process a single submission
  */
 async function processSubmission(job) {
-  const { submissionId, problemId, code, language, testcases = [],adminCode } = job;
+  const { submissionId, problemId, code, language, testcases = [], adminCode } = job;
   const startTime = Date.now();
 
-  console.log(`\n⏱️  Processing: ${submissionId}`);
-  console.log(`   Language: ${language}, Test cases: ${testcases.length}`);
+  console.log(`\n⏱️ Processing: ${submissionId}`);
+  console.log(`Language: ${language}, Test cases: ${testcases.length}`);
 
   monitor.startSubmission(submissionId);
 
   try {
-    // Execute code in container
     const result = await executeCode({
       code,
       lang: language,
@@ -51,22 +50,20 @@ async function processSubmission(job) {
     });
 
     const totalTime = Date.now() - startTime;
+
     monitor.recordExecution(submissionId, totalTime);
 
     console.log(`✨ Result: ${result.status} (${totalTime}ms)`);
-    console.log(`   Passed: ${result.passed}/${result.total}`);
 
-    // Update result via API
     await updateSubmissionResult(submissionId, {
       ...result,
       submissionId,
       totalTime,
-      processingTime: totalTime,
+      processingTime: totalTime
     });
 
     monitor.completeSubmission(submissionId, 'success');
 
-    // Print metrics periodically
     if (monitor.getMetrics().totalSubmissions % 5 === 0) {
       monitor.printMetrics();
       console.log(`📦 Container Pool:`, getPool().getStats());
@@ -74,6 +71,7 @@ async function processSubmission(job) {
     }
 
     return result;
+
   } catch (error) {
     console.error(`❌ Error processing ${submissionId}:`, error.message);
 
@@ -81,10 +79,11 @@ async function processSubmission(job) {
       status: 'System Error',
       error: error.message,
       testcases: [],
-      totalTime: Date.now() - startTime,
+      totalTime: Date.now() - startTime
     };
 
     await updateSubmissionResult(submissionId, errorResult);
+
     monitor.completeSubmission(submissionId, 'error');
 
     return errorResult;
@@ -92,55 +91,36 @@ async function processSubmission(job) {
 }
 
 /**
- * RabbitMQ message handler
+ * Handle message (only processing logic)
  */
 async function handleMessage(msg) {
-  if (!msg) return;
+  const content = msg.content.toString();
+  const job = JSON.parse(content);
 
-  try {
-    // Parse message
-    const content = msg.content.toString();
-    const job = JSON.parse(content);
+  console.log(`📨 Received job: ${job.submissionId}`);
 
-    console.log(`📨 Received job: ${job.submissionId}`);
-
-    // Process submission
-    await processSubmission(job);
-
-    // Acknowledge message
-    const ch = msg._channel || msg.channel;
-    if (ch && ch.ack) {
-      ch.ack(msg);
-    }
-  } catch (error) {
-    console.error('Message handler error:', error);
-
-    // Reject and requeue
-    const ch = msg._channel || msg.channel;
-    if (ch && ch.nack) {
-      ch.nack(msg, false, true);
-    }
-  }
+  await processSubmission(job);
 }
 
 /**
- * Start consuming messages from RabbitMQ
+ * Start worker
  */
 async function startWorker() {
+
   try {
+
     console.log('\n🚀 Starting Judge Worker...\n');
 
-    // Initialize container pool
+    const poolSize = parseInt(process.env.CONTAINER_POOL_SIZE || '2');
+
     const containerCount = await initializePool({
-      poolSize: parseInt(process.env.CONTAINER_POOL_SIZE || '2'),
-      image: 'judge-sandbox',
+      poolSize,
+      image: 'judge-sandbox'
     });
 
-    // Initialize connection pools
     await initializePools();
     redisPool = getRedisPool();
 
-    // Connect to RabbitMQ
     const connection = amqp.connect(['amqp://rabbitmq:5672']);
 
     connection.on('connect', () => {
@@ -148,78 +128,123 @@ async function startWorker() {
     });
 
     connection.on('disconnect', (err) => {
-      console.error('❌ Disconnected from RabbitMQ:', err);
+      console.error('❌ RabbitMQ disconnected:', err);
     });
 
-    // Create channel and configure
     const channelWrapper = connection.createChannel({
+
       setup: async (channel) => {
-        // Assert queue
+
         await channel.assertQueue(QUEUE_NAME, { durable: true });
 
-        // Set prefetch (process 2 jobs concurrently per worker)
-        await channel.prefetch(2);
+        // important: tie concurrency to container pool
+        await channel.prefetch(poolSize);
 
-        // Consume messages
-        await channel.consume(QUEUE_NAME, handleMessage);
+        await channel.consume(QUEUE_NAME, async (msg) => {
+
+          if (!msg) return;
+
+          try {
+
+            await handleMessage(msg);
+
+            channel.ack(msg);
+
+          } catch (error) {
+
+            console.error('Worker processing error:', error);
+
+            // requeue message
+            channel.nack(msg, false, true);
+          }
+
+        });
 
         console.log(`👂 Listening on queue: ${QUEUE_NAME}`);
-        console.log(`🏗️  Container Pool: ${containerCount} containers`);
-        console.log(`🔄 Prefetch: 2 jobs per worker\n`);
-      },
+        console.log(`🏗️ Container Pool: ${containerCount}`);
+        console.log(`🔄 Prefetch: ${poolSize}\n`);
+
+      }
     });
 
-    // Graceful shutdown
-    let isShuttingDown = false;
-    
-    const gracefulShutdown = async (signal) => {
-      if (isShuttingDown) return; // Prevent multiple shutdown calls
-      isShuttingDown = true;
-      
-      console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
-      
-      // Force exit after 15 seconds if shutdown takes too long
-      const shutdownTimeout = setTimeout(() => {
-        console.error('⚠️  Shutdown timeout, forcing exit...');
+    /**
+     * Graceful shutdown
+     */
+
+    let shuttingDown = false;
+
+    const shutdown = async (signal) => {
+
+      if (shuttingDown) return;
+
+      shuttingDown = true;
+
+      console.log(`\n🛑 Received ${signal}, shutting down...`);
+
+      const timeout = setTimeout(() => {
+        console.error('⚠️ Forced shutdown');
         process.exit(1);
       }, 15000);
-      
+
       try {
+
         monitor.printMetrics();
+
         await shutdownPool();
+
         await channelWrapper.close();
+
         await connection.close();
-        clearTimeout(shutdownTimeout);
-        console.log('✅ Graceful shutdown complete');
+
+        clearTimeout(timeout);
+
+        console.log('✅ Shutdown complete');
+
         process.exit(0);
-      } catch (error) {
-        console.error('Error during shutdown:', error);
-        clearTimeout(shutdownTimeout);
+
+      } catch (err) {
+
+        console.error('Shutdown error:', err);
+
+        clearTimeout(timeout);
+
         process.exit(1);
       }
     };
 
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-    process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    process.on('SIGHUP', shutdown);
 
-    // Print metrics every 60 seconds
+    /**
+     * Periodic metrics
+     */
+
     setInterval(() => {
+
       if (monitor.getMetrics().totalSubmissions > 0) {
+
         console.log('');
+
         monitor.printMetrics();
+
         console.log(`📦 Container Pool:`, getPool().getStats());
+
         console.log(`💾 Cache Stats:`, getCacheStats());
+
         console.log('');
       }
+
     }, 60000);
+
   } catch (error) {
+
     console.error('Worker startup failed:', error);
+
     process.exit(1);
   }
 }
 
-// Start the worker
 startWorker();
 
 export { processSubmission, handleMessage };

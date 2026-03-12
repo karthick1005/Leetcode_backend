@@ -4,11 +4,11 @@ const QUEUE_NAME = 'judge'
 const connection = amqp.connect(['amqp://rabbitmq:5672']);
 
 connection.on('connect', function() {
-    console.log('Connected!');
+    console.log('✅ RabbitMQ Connected');
 });
 
 connection.on('disconnect', function(err) {
-    console.log('Disconnected.', err);
+    console.log('❌ RabbitMQ Disconnected:', err);
 });
 
 const channelWrapper = connection.createChannel({
@@ -20,14 +20,21 @@ const channelWrapper = connection.createChannel({
 });
 
 export const sendMessage = async (data) => {
-    channelWrapper.sendToQueue(QUEUE_NAME, data)
-    .then(function() {
-        console.log("Message sent");
-    })
-    .catch(function(err) {
-        console.log("Message was rejected:", err.stack);
-        channelWrapper.close();
-        connection.close();
-    });
+    try {
+        // Wait for channel to be ready
+        await channelWrapper.waitForConnect();
+        
+        console.log(`📨 Sending message to queue '${QUEUE_NAME}':`, data.submissionId);
+        
+        // Send message to queue
+        await channelWrapper.sendToQueue(QUEUE_NAME, data);
+        
+        console.log(`✅ Message sent successfully: ${data.submissionId}`);
+        return true;
+    } catch (error) {
+        console.error(`❌ Failed to send message:`, error.message);
+        throw error;
+    }
 };
+
 
