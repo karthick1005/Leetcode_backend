@@ -81,7 +81,8 @@ function cacheBinary(cacheKey, binaryPath) {
  */
 async function executeInContainer(container, cmd, input, timeout = 5000) {
   return new Promise((resolve, reject) => {
-    let stdout = '';
+    let stdout = "";
+    let stderr = "";
     let killed = false;
 
     const timeoutHandle = setTimeout(() => {
@@ -89,74 +90,57 @@ async function executeInContainer(container, cmd, input, timeout = 5000) {
       reject(new Error(`Timeout (${timeout}ms)`));
     }, timeout);
 
-    try {
-      // If input is provided, prepend input as a command that echoes it
-      let finalCmd = cmd;
-      if (input) {
-        // Use echo to pipe input to the command
-        finalCmd = `echo '${input.replace(/'/g, "'\\''")}' | ${cmd}`;
-      }
+    let finalCmd = cmd;
+    if (input) {
+      finalCmd = `echo '${input.replace(/'/g, "'\\''")}' | ${cmd}`;
+    }
 
-      // Create exec instance
-      container.exec(
-        {
-          Cmd: ['/bin/sh', '-c', finalCmd],
-          AttachStdout: true,
-          AttachStderr: true,
-        },
-        async (err, exec) => {
+    container.exec(
+      {
+        Cmd: ["/bin/sh", "-c", finalCmd],
+        AttachStdout: true,
+        AttachStderr: true,
+      },
+      (err, exec) => {
+        if (err) {
+          clearTimeout(timeoutHandle);
+          return reject(err);
+        }
+
+        exec.start({ Tty: false }, (err, stream) => {
           if (err) {
             clearTimeout(timeoutHandle);
-            reject(err);
-            return;
+            return reject(err);
           }
 
-          try {
-            // Start the exec
-            exec.start(
-              { Detach: false, Tty: false },
-              (startErr, stream) => {
-                if (startErr) {
-                  clearTimeout(timeoutHandle);
-                  reject(startErr);
-                  return;
-                }
-
-                // Collect stream data
-                stream.on('data', (data) => {
-                  if (!killed) {
-                    stdout += data.toString();
-                  }
-                });
-
-                stream.on('error', (streamErr) => {
-                  clearTimeout(timeoutHandle);
-                  if (!killed) {
-                    reject(streamErr);
-                  }
-                });
-
-                stream.on('end', () => {
-                  clearTimeout(timeoutHandle);
-                  if (!killed) {
-                    resolve({ stdout, stderr: '', code: 0 });
-                  }
-                });
+          container.modem.demuxStream(
+            stream,
+            {
+              write: (chunk) => {
+                if (!killed) stdout += chunk.toString();
               }
-            );
-          } catch (execErr) {
+            },
+            {
+              write: (chunk) => {
+                if (!killed) stderr += chunk.toString();
+              }
+            }
+          );
+
+          stream.on("end", () => {
             clearTimeout(timeoutHandle);
-            reject(execErr);
-          }
-        }
-      );
-    } catch (err) {
-      clearTimeout(timeoutHandle);
-      reject(err);
-    }
+            if (!killed) resolve({ stdout, stderr, code: 0 });
+          });
+
+          stream.on("error", (e) => {
+            clearTimeout(timeoutHandle);
+            reject(e);
+          });
+        });
+      }
+    );
   });
 }
-
 // ============= MAIN EXECUTION =============
 function normalizeOutput(str) {
   return String(str)
@@ -171,7 +155,7 @@ function normalizeOutput(str) {
  * Execute code in container
  */
 export async function executeCode(payload) {
-  const { code, lang, testcases, submissionId, timeout = 5 } = payload;
+  const { code, lang, testcases, submissionId, timeout = 5, adminCode } = payload;
 
   if (!LANGUAGES[lang]) {
     throw new Error(`Unsupported language: ${lang}`);
@@ -180,6 +164,54 @@ export async function executeCode(payload) {
   const langConfig = LANGUAGES[lang];
   const execTimeout = Math.min(parseInt(timeout) || 5, 15) * 1000;
   const cacheKey = getCacheKey(code, lang);
+
+  // If adminCode is provided, we need to execute it first to get expected outputs
+  let processedTestcases = testcases;
+  if (adminCode && testcases.length > 0 && !testcases[0].expected) {
+    console.log(`[${submissionId}] 🔍 Processing testcases with admin code...`);
+    processedTestcases = [];
+    
+    const adminContainer = await getPool().acquire();
+    const adminContainerId = adminContainer.id ? adminContainer.id.substring(0, 12) : 'unknown';
+    
+    try {
+      for (let i = 0; i < testcases.length; i++) {
+        const testInput = testcases[i].input || testcases[i];
+        console.log(`[${submissionId}] 🏃 Executing admin code for testcase ${i + 1}/${testcases.length}...`);
+        
+        // Write admin code to file
+        const adminExecDir = `/tmp/admin_exec/${submissionId}_${i}`;
+        await executeInContainer(adminContainer, `mkdir -p ${adminExecDir}`);
+        
+        const adminFile = `${adminExecDir}/admin.${langConfig.ext}`;
+        const adminWriteCmd = `cat > ${adminFile} << 'EOF'\n${adminCode}\nEOF`;
+        await executeInContainer(adminContainer, adminWriteCmd);
+        
+        // Execute admin code with input
+        const adminRunCmd = langConfig.run(adminFile);
+        const inputFile = `${adminExecDir}/input.txt`;
+        await executeInContainer(adminContainer, `echo -n "${testInput.replace(/"/g, '\\"')}" > ${inputFile}`);
+        
+        const adminResult = await executeInContainer(
+          adminContainer,
+          `cd ${adminExecDir} && ${adminRunCmd} < ${inputFile}`,
+          null,
+          execTimeout
+        );
+        
+        const expectedOutput = normalizeOutput(adminResult.stdout);
+        console.log(`[${submissionId}] ✅ Admin output for testcase ${i + 1}: "${expectedOutput}"`);
+        
+        processedTestcases.push({
+          input: testInput,
+          expected: expectedOutput
+        });
+      }
+    } finally {
+      // Release admin container
+      await getPool().release(adminContainer);
+    }
+  }
 
   const container = await getPool().acquire();
   const containerId = container.id ? container.id.substring(0, 12) : 'unknown';
@@ -252,9 +284,9 @@ export async function executeCode(payload) {
     }
 
     // Step 3: Execute test cases in parallel
-    console.log(`[${submissionId}] 🧪 Executing ${testcases.length} test case(s) in container ${containerId}...`);
+    console.log(`[${submissionId}] 🧪 Executing ${processedTestcases.length} test case(s) in container ${containerId}...`);
 
-    const executions = testcases.map(async (testcase, index) => {
+    const executions = processedTestcases.map(async (testcase, index) => {
       try {
         // Validate testcase has required fields
         if (!testcase || typeof testcase !== 'object') {
@@ -273,7 +305,7 @@ export async function executeCode(payload) {
         let expected = String(testcase.expected || '').trim();
 
         const runCmd = langConfig.run(binaryPath);
-        console.log(`[${submissionId}] ▶️  Test case ${index + 1}/${testcases.length}: Running in ${containerId}`);
+        console.log(`[${submissionId}] ▶️  Test case ${index + 1}/${processedTestcases.length}: Running in ${containerId}`);
         
         // Create input file for stdin
         const inputFile = `${execDir}/test_input_${index}.txt`;

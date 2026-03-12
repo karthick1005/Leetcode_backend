@@ -31,7 +31,7 @@ async function updateSubmissionResult(submissionId, result) {
  * Process a single submission
  */
 async function processSubmission(job) {
-  const { submissionId, problemId, code, language, testcases = [] } = job;
+  const { submissionId, problemId, code, language, testcases = [],adminCode } = job;
   const startTime = Date.now();
 
   console.log(`\n⏱️  Processing: ${submissionId}`);
@@ -47,6 +47,7 @@ async function processSubmission(job) {
       testcases,
       submissionId,
       timeout: 5,
+      adminCode
     });
 
     const totalTime = Date.now() - startTime;

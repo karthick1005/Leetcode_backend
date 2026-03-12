@@ -132,9 +132,13 @@ app.get('/', (req, res) => {
  * Submit code for judging
  * POST /submit
  */
+const groupTestcases = (testcases, n = 1) =>
+  Array.from({ length: Math.ceil(testcases.length / n) }, (_, i) =>
+    testcases.slice(i * n, i * n + n).join("\n")
+  );
 app.post('/submit', async (req, res) => {
   try {
-    const { problemId, code, language, userId, testcases = [] } = req.body;
+    const { problemId, code, language, userId, testcases = [], quesId } = req.body;
 
     // Validation
     if (!problemId || !code || !language || !userId) {
@@ -145,15 +149,43 @@ app.post('/submit', async (req, res) => {
     const submissionId = `${userId}-${problemId}-${uuidv4()}`;
 
     console.log(`📝 New submission: ${submissionId}`);
+    
+    // Fetch problem details from Firestore (just code templates, admin code execution moves to worker)
+    let adminCode = null;
+    let remainingCode = null;
+    let groupedTestcases = testcases;
+    try {
+      const docSnap = await getDoc(doc(db, 'problem', quesId));
+      if (docSnap.exists()) {
+        const problemData = docSnap.data();
+        
+        // Decode admin code and remaining code
+        adminCode = problemData.Adminsrc
+        remainingCode = atob(problemData.Remaining[language] || '');
+        groupedTestcases=groupTestcases(testcases, problemData.Inputname.length || 1)
 
-    // Prepare job
+        console.log(`✅ Loaded admin code and remaining code for ${language}`);
+      } else {
+        return res.status(404).json(errorResponse(404, 'Problem not found'));
+      }
+    } catch (error) {
+      console.error('Failed to fetch problem from Firestore:', error);
+      return res.status(500).json(errorResponse(500, 'Failed to load problem'));
+    }
+
+    // Merge user code into remaining code
+    const mergedCode = remainingCode.replace('// INSERT_CODE_HERE', code);
+
+    // Prepare job for worker
+    // Testcases contain only inputs - worker will execute admin code to get expected outputs
     const job = {
       submissionId,
       problemId,
       userId,
-      code,
+      code: mergedCode,
       language,
-      testcases,
+      testcases: groupedTestcases,  // Raw inputs only
+      adminCode,  // Send admin code to worker for execution in containers
       submittedAt: new Date().toISOString(),
     };
 
@@ -166,15 +198,15 @@ app.post('/submit', async (req, res) => {
       });
     } catch (error) {
       console.warn('Firestore save failed:', error.message);
-      // Continue anyway - Redis will store result
     }
 
     // Set initial status in Redis with short TTL (5 min)
-    // If worker picks it up and updates status, the new status will have longer TTL
     await setInRedis(`submission:${submissionId}:status`, 'queued', 300);
 
     // Send to RabbitMQ queue
     await sendMessage(job);
+
+    console.log(`📤 Sent to queue: ${submissionId} with ${testcases.length} testcases`);
 
     // Return submission ID
     res.status(202).json(
