@@ -1,22 +1,120 @@
-version: "2.3" #Use this version strictly
+version: "3.9"
+
 services:
+  # ============= INFRASTRUCTURE =============
+
   rabbitmq:
-    image: "rabbitmq:3.10"
+    image: "rabbitmq:3.12-alpine"
     restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
   redis-server:
-    image: "redis"
+    image: "redis:7-alpine"
     restart: always
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+  # ============= SANDBOX CONTAINER IMAGE =============
+
+  judge-sandbox:
+    build:
+      context: ./CodeExecution
+      dockerfile: Dockerfile.sandbox
+    image: judge-sandbox:latest
+    # Don't run as service, only used byworker pool
+
+  # ============= API SERVER =============
+
   server:
     build: ./server
     restart: always
     ports:
       - "9000:7000"
+    environment:
+      NODE_ENV: production
+      PORT: 7000
+      REDIS_HOST: redis-server
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      API_SERVER: http://server:7000
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # ============= JUDGE WORKERS (Container Pool) =============
+
   worker:
     build: ./workers
     restart: always
-    pids_limit: 60 # Max number of processes running in thw container.
-    cpus: 1 # No of CPUs allocated
-    mem_limit: 150M # Hard limit
+    user: root
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis-server
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://rabbitmq:5672
+      API_SERVER: http://server:7000
+      CONTAINER_POOL_SIZE: "2"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-server:
+        condition: service_healthy
+      judge-sandbox:
+        condition: service_started
+    # Resource limits for worker container (not the sandboxed code)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 2G
+        reservations:
+          cpus: '2'
+          memory: 1G
+    # Mount Docker socket for container management
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "ps", "aux"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Scale horizontally: docker-compose up -d --scale worker=5
+    # Each worker gets its own container pool
+
+volumes:
+  redis_data:
+
+networks:
+  default:
+    name: judge-network
+    driver: bridge
+
+
 

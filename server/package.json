@@ -2,7 +2,7 @@
   "name": "judge",
   "version": "1.0.0",
   "type": "module",
-  "description": "",
+  "description": "LeetCode-style online judge server",
   "main": "app.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -18,6 +18,8 @@
     "ejs": "^3.0.2",
     "express": "^4.17.1",
     "firebase": "^11.1.0",
+    "ws": "^8.14.2",
+    "uuid": "^9.0.1",
     "nodemon": "^2.0.2",
     "pm2": "^6.0.14",
     "redis": "^3.0.2",

@@ -1,125 +1,224 @@
-import fs from "fs";
-import { client } from "./config/redis.js";
-import { deleteFolder, execute } from "./utils.js"
-import "./config/rabbitmq.js";
-import Dockerode from "dockerode";
+/**
+ * Judge Worker with Container Pool
+ * Processes submissions from RabbitMQ queue using pooled Docker containers
+ */
 
-const docker = new Dockerode({
-  socketPath: "/var/run/docker.sock",
-});
+import { initializePool, shutdownPool, getPool } from './containerPool.js';
+import { executeCode, getCacheStats } from './sandboxExecutor.js';
+import { initializePools, getRedisPool } from './pool.js';
+import { monitor } from './monitor.js';
+import * as amqp from 'amqp-connection-manager';
+import axios from 'axios';
 
-const runCode = async (apiBody, ch, msg) => {
-  let container = null;
+const QUEUE_NAME = 'judge';
+const API_SERVER = process.env.API_SERVER || 'http://server:7000';
+
+let redisPool = null;
+
+/**
+ * Update submission result via API
+ */
+async function updateSubmissionResult(submissionId, result) {
+  try {
+    await axios.put(`${API_SERVER}/submissions/${submissionId}/result`, result);
+    console.log(`✅ Result pushed for ${submissionId}`);
+  } catch (error) {
+    console.error(`Failed to update result for ${submissionId}:`, error.message);
+  }
+}
+
+/**
+ * Process a single submission
+ */
+async function processSubmission(job) {
+  const { submissionId, problemId, code, language, testcases = [] } = job;
+  const startTime = Date.now();
+
+  console.log(`\n⏱️  Processing: ${submissionId}`);
+  console.log(`   Language: ${language}, Test cases: ${testcases.length}`);
+
+  monitor.startSubmission(submissionId);
 
   try {
-    // Mark job as processing
-    await client.set(apiBody.folder.toString(), "Processing");
-
-    const myObjectString = JSON.stringify(apiBody);
-
-    const containerConfig = {
-      Image: "codeengine", // your execution image
-      Env: [`MY_OBJECT=${myObjectString}`],
-      Tty: false, // IMPORTANT: disable TTY for proper logs
-      HostConfig: {
-        AutoRemove: false, // keep container for debugging
-      },
-    };
-
-    console.log("Creating execution container...");
-
-    // 1️⃣ Create container
-    container = await docker.createContainer(containerConfig);
-    console.log("Container created:", container.id);
-
-    // 2️⃣ Start container
-    await container.start();
-    console.log("Container started:", container.id);
-
-    // 3️⃣ Wait for execution to finish
-    const waitResult = await container.wait();
-    console.log("Container exited with code:", waitResult.StatusCode);
-
-    // 4️⃣ Read logs AFTER exit (CRITICAL)
-    const logsBuffer = await container.logs({
-      stdout: true,
-      stderr: true,
+    // Execute code in container
+    const result = await executeCode({
+      code,
+      lang: language,
+      testcases,
+      submissionId,
+      timeout: 5,
     });
 
-    const output = logsBuffer.toString();
-    console.log("RAW CONTAINER OUTPUT:\n", output);
+    const totalTime = Date.now() - startTime;
+    monitor.recordExecution(submissionId, totalTime);
 
-    // 5️⃣ Validate output
-    if (!output || output.trim().length === 0) {
-      throw new Error("Execution container produced no output");
+    console.log(`✨ Result: ${result.status} (${totalTime}ms)`);
+    console.log(`   Passed: ${result.passed}/${result.total}`);
+
+    // Update result via API
+    await updateSubmissionResult(submissionId, {
+      ...result,
+      submissionId,
+      totalTime,
+      processingTime: totalTime,
+    });
+
+    monitor.completeSubmission(submissionId, 'success');
+
+    // Print metrics periodically
+    if (monitor.getMetrics().totalSubmissions % 5 === 0) {
+      monitor.printMetrics();
+      console.log(`📦 Container Pool:`, getPool().getStats());
+      console.log(`💾 Cache Stats:`, getCacheStats());
     }
 
-    // 6️⃣ Extract result safely
-    const regex = /Data to returned back:\s*(\{[\s\S]*\})/;
-    const match = regex.exec(output);
+    return result;
+  } catch (error) {
+    console.error(`❌ Error processing ${submissionId}:`, error.message);
 
-    if (!match || !match[1]) {
-      console.error("Output format mismatch");
-      console.error("FULL OUTPUT:", output);
+    const errorResult = {
+      status: 'System Error',
+      error: error.message,
+      testcases: [],
+      totalTime: Date.now() - startTime,
+    };
 
-      await client.setex(
-        apiBody.folder.toString(),
-        3600,
-        JSON.stringify({
-          error: "Invalid container output",
-          raw: output,
-        })
-      );
+    await updateSubmissionResult(submissionId, errorResult);
+    monitor.completeSubmission(submissionId, 'error');
 
-      return;
-    }
-
-    // 7️⃣ Parse result
-    const jsonData = JSON.parse(match[1]);
-    console.log("Parsed execution result:", jsonData);
-
-    await client.setex(
-      apiBody.folder.toString(),
-      3600,
-      JSON.stringify(jsonData)
-    );
-
-  } catch (err) {
-    console.error("Execution error:", err);
-
-    await client.setex(
-      apiBody.folder.toString(),
-      3600,
-      JSON.stringify({
-        error: err.message || "Execution failed",
-      })
-    );
-
-  } finally {
-    // 8️⃣ Cleanup container safely
-    if (container) {
-      try {
-        await container.remove({ force: true });
-        console.log("Container removed:", container.id);
-      } catch (cleanupErr) {
-        console.error("Failed to cleanup container:", cleanupErr.message);
-      }
-    }
-
-    // 9️⃣ Acknowledge RabbitMQ message
-    ch.ack(msg);
+    return errorResult;
   }
-};
+}
 
+/**
+ * RabbitMQ message handler
+ */
+async function handleMessage(msg) {
+  if (!msg) return;
 
+  try {
+    // Parse message
+    const content = msg.content.toString();
+    const job = JSON.parse(content);
 
-export const createFiles = async (apiBody, ch, msg) => {
-    try {
-        // await fs.promises.mkdir(`/temp/${apiBody.folder}`);
-        // await fs.promises.writeFile(`/temp/${apiBody.folder}/input.txt`, apiBody.input);
-        // await fs.promises.writeFile(`/temp/${apiBody.folder}/source.${extensions[apiBody.lang]}`, apiBody.src);
-        runCode(apiBody, ch, msg);
-    } catch (error) {
-        console.log(error)
+    console.log(`📨 Received job: ${job.submissionId}`);
+
+    // Process submission
+    await processSubmission(job);
+
+    // Acknowledge message
+    const ch = msg._channel || msg.channel;
+    if (ch && ch.ack) {
+      ch.ack(msg);
     }
-};
+  } catch (error) {
+    console.error('Message handler error:', error);
+
+    // Reject and requeue
+    const ch = msg._channel || msg.channel;
+    if (ch && ch.nack) {
+      ch.nack(msg, false, true);
+    }
+  }
+}
+
+/**
+ * Start consuming messages from RabbitMQ
+ */
+async function startWorker() {
+  try {
+    console.log('\n🚀 Starting Judge Worker...\n');
+
+    // Initialize container pool
+    const containerCount = await initializePool({
+      poolSize: parseInt(process.env.CONTAINER_POOL_SIZE || '2'),
+      image: 'judge-sandbox',
+    });
+
+    // Initialize connection pools
+    await initializePools();
+    redisPool = getRedisPool();
+
+    // Connect to RabbitMQ
+    const connection = amqp.connect(['amqp://rabbitmq:5672']);
+
+    connection.on('connect', () => {
+      console.log('✅ Connected to RabbitMQ');
+    });
+
+    connection.on('disconnect', (err) => {
+      console.error('❌ Disconnected from RabbitMQ:', err);
+    });
+
+    // Create channel and configure
+    const channelWrapper = connection.createChannel({
+      setup: async (channel) => {
+        // Assert queue
+        await channel.assertQueue(QUEUE_NAME, { durable: true });
+
+        // Set prefetch (process 2 jobs concurrently per worker)
+        await channel.prefetch(2);
+
+        // Consume messages
+        await channel.consume(QUEUE_NAME, handleMessage);
+
+        console.log(`👂 Listening on queue: ${QUEUE_NAME}`);
+        console.log(`🏗️  Container Pool: ${containerCount} containers`);
+        console.log(`🔄 Prefetch: 2 jobs per worker\n`);
+      },
+    });
+
+    // Graceful shutdown
+    let isShuttingDown = false;
+    
+    const gracefulShutdown = async (signal) => {
+      if (isShuttingDown) return; // Prevent multiple shutdown calls
+      isShuttingDown = true;
+      
+      console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
+      
+      // Force exit after 15 seconds if shutdown takes too long
+      const shutdownTimeout = setTimeout(() => {
+        console.error('⚠️  Shutdown timeout, forcing exit...');
+        process.exit(1);
+      }, 15000);
+      
+      try {
+        monitor.printMetrics();
+        await shutdownPool();
+        await channelWrapper.close();
+        await connection.close();
+        clearTimeout(shutdownTimeout);
+        console.log('✅ Graceful shutdown complete');
+        process.exit(0);
+      } catch (error) {
+        console.error('Error during shutdown:', error);
+        clearTimeout(shutdownTimeout);
+        process.exit(1);
+      }
+    };
+
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
+
+    // Print metrics every 60 seconds
+    setInterval(() => {
+      if (monitor.getMetrics().totalSubmissions > 0) {
+        console.log('');
+        monitor.printMetrics();
+        console.log(`📦 Container Pool:`, getPool().getStats());
+        console.log(`💾 Cache Stats:`, getCacheStats());
+        console.log('');
+      }
+    }, 60000);
+  } catch (error) {
+    console.error('Worker startup failed:', error);
+    process.exit(1);
+  }
+}
+
+// Start the worker
+startWorker();
+
+export { processSubmission, handleMessage };

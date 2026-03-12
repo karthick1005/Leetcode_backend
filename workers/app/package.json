@@ -1,22 +1,23 @@
 {
-  "name": "judge",
+  "name": "judge-worker",
   "version": "1.0.0",
-  "description": "",
+  "description": "LeetCode-style judge worker with container pool",
   "main": "app.js",
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "nodemon app.js"
+    "start": "node app.js",
+    "dev": "nodemon app.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "amqp-connection-manager": "^3.2.0",
-    "amqplib": "^0.10.9",
-    "bail": "^1.0.5",
+    "amqplib": "^0.5.6",
+    "axios": "^1.6.2",
     "dockerode": "^4.0.2",
-    "nodemon": "^2.0.2",
     "redis": "^3.0.2",
-    "rimraf": "^3.0.2"
+    "rimraf": "^3.0.2",
+    "nodemon": "^2.0.2"
   }
 }

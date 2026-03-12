@@ -31,3 +31,25 @@ export const getFromRedis = (key) => {
         });
     })
 }
+
+export const setInRedis = (key, value, ttl) => {
+    return new Promise((resolve, reject) => {
+        if (ttl) {
+            client.setex(key, ttl, value, (err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(value);
+                }
+            });
+        } else {
+            client.set(key, value, (err) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(value);
+                }
+            });
+        }
+    })
+}

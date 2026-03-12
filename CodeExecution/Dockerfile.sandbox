@@ -1,0 +1,49 @@
+# Judge Sandbox Container Image
+# Used by container pool for isolated code execution
+
+FROM ubuntu:22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    nodejs \
+    npm \
+    g++ \
+    gcc \
+    make \
+    openjdk-11-jdk \
+    dotnet-sdk-6.0 \
+    curl \
+    wget \
+    git \
+    cgroup-tools \
+    procps \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create execution directory
+RUN mkdir -p /tmp/execution && \
+    chmod 1777 /tmp/execution
+
+# Create judge user (non-root for security)
+RUN useradd -m -u 1001 judge && \
+    chown -R judge:judge /tmp/execution
+
+# Verify language installations
+RUN python3 --version && \
+    node --version && \
+    g++ --version && \
+    gcc --version && \
+    java -version && \
+    dotnet --version
+
+# Health check (always ready)
+HEALTHCHECK --interval=60s --timeout=3s --start-period=5s --retries=1 \
+    CMD ps aux | grep -q "[s]leep" || exit 1
+
+# Keep container running
+CMD ["/bin/sleep", "infinity"]
