@@ -7,8 +7,10 @@ import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
-import { v4 as uuidv4 } from 'uuid';
+import ws from 'ws';
+const { Server: WebSocketServer } = ws;
+import uuidPkg from 'uuid';
+const { v4: uuidv4 } = uuidPkg;
 import { sendMessage } from './config/rabbitmq.js';
 import { getFromRedis, setInRedis, errorResponse, successResponse } from './utils.js';
 import { doc, setDoc, updateDoc, getDoc, collection, query, where, orderBy, limit, getDocs } from 'firebase/firestore';
@@ -159,8 +161,14 @@ app.post('/submit', async (req, res) => {
       if (docSnap.exists()) {
         const problemData = docSnap.data();
         
-        // Decode admin code and remaining code
-        adminCode = problemData.Adminsrc
+        // Decode admin code from base64 (same format as frontend)
+        try {
+          adminCode = atob(problemData.Adminsrc || '');
+        } catch (decodeError) {
+          console.warn('Failed to decode admin code:', decodeError.message);
+          adminCode = problemData.Adminsrc; // Fallback to plain text if decode fails
+        }
+        
         remainingCode = atob(problemData.Remaining[language] || '');
         groupedTestcases=groupTestcases(testcases, problemData?.Inputname?.length || 1)
 
@@ -199,6 +207,7 @@ app.post('/submit', async (req, res) => {
     } catch (error) {
       console.warn('Firestore save failed:', error.message);
     }
+
 
     // Set initial status in Redis with short TTL (5 min)
     await setInRedis(`submission:${submissionId}:status`, 'queued', 300);
@@ -402,6 +411,156 @@ app.get('/metrics', async (req, res) => {
     );
   } catch (error) {
     res.status(500).json(errorResponse(500, 'Failed to retrieve metrics'));
+  }
+});
+
+// ============= ADMIN ENDPOINTS =============
+
+/**
+ * Load problem for admin editing
+ * GET /api/problems/:problemId
+ */
+app.get('/api/problems/:problemId', async (req, res) => {
+  try {
+    const { problemId } = req.params;
+    console.log(`🔍 Fetching problem ${problemId} for admin`);
+    const docSnap = await getDoc(doc(db, 'problem', problemId));
+    if (docSnap.exists()) {
+      res.json(successResponse(docSnap.data()));
+    } else {
+      res.status(404).json(errorResponse(404, 'Problem not found'));
+    }
+  } catch (error) {
+    console.error('Get problem error:', error);
+    res.status(500).json(errorResponse(500, 'Failed to load problem'));
+  }
+});
+
+/**
+ * Save problem to Firestore
+ * PUT /api/problems/:problemId
+ */
+app.put('/api/problems/:problemId', async (req, res) => {
+  try {
+    const { problemId } = req.params;
+    const { Adminsrc, Inputname, Remaining, Testcases, Timeout } = req.body;
+
+    await setDoc(
+      doc(db, 'problem', problemId),
+      {
+        Adminsrc,
+        // Inputname,
+        // Remaining,
+        // // Testcases,
+        // Timeout,
+        // updatedAt: new Date(),
+      },
+      { merge: true }
+    );
+
+    res.json(successResponse({ problemId, message: 'Problem saved successfully' }));
+  } catch (error) {
+    console.error('Save problem error:', error);
+    res.status(500).json(errorResponse(500, 'Failed to save problem'));
+  }
+});
+
+/**
+ * Execute admin code to generate expected outputs
+ * POST /api/execute-admin - Queue job and return immediately with jobId
+ */
+app.post('/api/execute-admin', async (req, res) => {
+  try {
+    const { adminCode, testcases, language } = req.body;
+
+    if (!adminCode || !testcases || !language) {
+      return res.status(400).json(errorResponse(400, 'Missing required fields'));
+    }
+
+    // Create a unique job ID for this execution
+    const jobId = `admin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Send to worker for execution
+    const job = {
+      type: 'admin-execute',
+      jobId,
+      code: adminCode,
+      language,
+      testcases,
+      timestamp: new Date().toISOString(),
+    };
+
+    await sendMessage(job);
+
+    // Return immediately with jobId - frontend will poll for results
+    console.log(`📨 Queued admin execution: ${jobId}`);
+    res.status(202).json(
+      successResponse({
+        success: true,
+        jobId,
+        message: 'Admin code execution queued. Poll /api/execute-admin/:jobId for results.',
+        timestamp: new Date().toISOString()
+      })
+    );
+
+  } catch (error) {
+    console.error('Execute admin error:', error);
+    res.status(500).json(errorResponse(500, 'Failed to queue admin code execution'));
+  }
+});
+
+/**
+ * Get admin code execution result
+ * GET /api/execute-admin/:jobId - Retrieve result from Redis cache
+ */
+app.get('/api/execute-admin/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    if (!jobId) {
+      return res.status(400).json(errorResponse(400, 'Job ID is required'));
+    }
+
+    try {
+      // Try to get result from Redis
+      const redisKey = `admin-execute:${jobId}`;
+      const cachedResult = await getFromRedis(redisKey);
+      console.log(`🔍 Checking Redis for admin execution result: ${jobId}`, cachedResult);
+      if (cachedResult) {
+        let result;
+        try {
+          result = typeof cachedResult === 'string' ? JSON.parse(cachedResult) : cachedResult;
+        } catch (parseError) {
+          console.error(`Failed to parse cached result: ${parseError.message}`);
+          return res.status(500).json(errorResponse(500, 'Invalid cached result format'));
+        }
+        
+        console.log(`✅ Returning admin execution result: ${jobId}`);
+        return res.status(200).json(
+          successResponse(result)
+        );
+      } else {
+        // Result not yet available - still processing
+        console.log(`⏳ Admin execution still processing: ${jobId}`);
+        return res.status(202).json(
+          successResponse({
+            success: null,
+            jobId,
+            status: 'pending',
+            message: 'Execution in progress. Check again shortly.'
+          })
+        );
+      }
+    } catch (error) {
+      console.error('Redis result retrieval error:', error.message);
+      return res.status(500).json(
+        errorResponse(500, 'Failed to retrieve execution result')
+      );
+    }
+
+  } catch (error) {
+    console.error('Get admin result error:', error);
+    res.status(500).json(errorResponse(500, 'Failed to get admin execution result'));
   }
 });
 

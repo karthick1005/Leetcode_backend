@@ -38,5 +38,5 @@ WORKDIR /usr/src/app/app
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
   CMD node -e "console.log('OK')" || exit 1
 
-# Start worker
-CMD ["npm", "start"]
+# Start worker with nodemon in development, regular npm start in production
+CMD if [ "$NODE_ENV" = "development" ]; then npm run dev; else npm start; fi

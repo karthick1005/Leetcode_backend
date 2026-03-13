@@ -4,7 +4,7 @@
  */
 
 import { initializePool, shutdownPool, getPool } from './containerPool.js';
-import { executeCode, getCacheStats } from './sandboxExecutor.js';
+import { executeCode, executeExpectedCode, getCacheStats } from './sandboxExecutor.js';
 import { initializePools, getRedisPool } from './pool.js';
 import { monitor } from './monitor.js';
 import * as amqp from 'amqp-connection-manager';
@@ -21,7 +21,7 @@ let redisPool = null;
 async function updateSubmissionResult(submissionId, result) {
   try {
     await axios.put(`${API_SERVER}/submissions/${submissionId}/result`, result);
-    console.log(`✅ Result pushed for ${submissionId}`);
+    console.log(`✅ Result pushed  for ${submissionId}`);
   } catch (error) {
     console.error(`Failed to update result for ${submissionId}:`, error.message);
   }
@@ -91,15 +91,127 @@ async function processSubmission(job) {
 }
 
 /**
+ * Execute admin code to generate expected outputs
+ * Executes reference solution against test inputs
+ */
+async function executeAdminCode(job) {
+  const { code, language, testcases, timestamp,jobId } = job;
+  // const jobId = `admin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+  console.log(`\n⏭️ Executing Admin Code: ${jobId}`);
+  console.log(`   Language: ${language}`);
+  console.log(`   Test cases: ${testcases.length}`);
+  console.log(`   Code length: ${code.length} chars`);
+
+  const startTime = Date.now();
+
+  try {
+    // Format testcases as objects with input and empty expected
+    // This matches the format used for user submissions
+    const formattedTestcases = testcases.map(input => ({
+      input: typeof input === 'string' ? input : (input.input || ''),
+      expected: '' // Will be filled by executeCode
+    }));
+
+    console.log(`   📝 Formatted ${formattedTestcases.length} test cases`);
+
+    // Execute admin code against all testcases
+    // This way it processes them the same way as user code execution
+    const result = await executeExpectedCode({
+      code,
+      lang: language,
+      testcases: formattedTestcases,
+      submissionId: jobId,
+      timeout: 5,
+      jobId
+    });
+    console.log(`   ✅ Admin code executed in ${Date.now() - startTime}ms`,result);
+    const totalTime = Date.now() - startTime;
+
+    // Extract outputs from test case results
+    const outputs = result.testcases?.map(tc => tc.output || '') || [];
+
+    console.log(`   ✅ Generated ${outputs.length} outputs`);
+    console.log(`   📊 Output details:`, outputs);
+
+    // Ensure all values are properly serializable
+    const finalResult = {
+      success: true,
+      outputs: outputs.map(o => String(o || '')), // Convert to strings
+      count: outputs.length,
+      totalTime: Number(totalTime),
+      timestamp: new Date().toISOString(),
+      jobId,
+      result
+    };
+
+    // Validate result before caching
+    console.log(`   🔍 Validating result for Redis caching...`);
+    const jsonStr = JSON.stringify(finalResult);
+    console.log(`   ✔️ Result stringified successfully (${jsonStr} bytes)`);
+
+    // Store result in Redis for frontend retrieval
+    if (redisPool) {
+      const client = await redisPool.acquire();
+      try {
+        const redisKey = `admin-execute:${jobId}`;
+        await client.setex(redisKey, 3600, jsonStr); // 1 hour TTL
+        console.log(`   💾 Result cached in Redis: ${redisKey}`);
+      } catch (error) {
+        console.error(`   ⚠️ Failed to cache in Redis:`, error.message);
+      } finally {
+        await redisPool.release(client);
+      }
+    }
+
+    console.log(`✨ Admin code execution complete (${totalTime}ms)`);
+    return finalResult;
+
+  } catch (error) {
+    console.error(`❌ Failed to execute admin code: ${jobId}`, error.message);
+
+    const errorResult = {
+      success: false,
+      outputs: [],
+      error: String(error.message || 'Unknown error'),
+      totalTime: Number(Date.now() - startTime),
+      jobId
+    };
+
+    // Cache error result too
+    if (redisPool) {
+      const client = await redisPool.acquire();
+      try {
+        const redisKey = `admin-execute:${jobId}`;
+        const errorJsonStr = JSON.stringify(errorResult);
+        await client.setex(redisKey, 3600, errorJsonStr);
+      } catch (e) {
+        console.error(`Failed to cache error in Redis:`, e.message);
+      } finally {
+        await redisPool.release(client);
+      }
+    }
+
+    return errorResult;
+  }
+}
+
+/**
  * Handle message (only processing logic)
  */
 async function handleMessage(msg) {
   const content = msg.content.toString();
   const job = JSON.parse(content);
 
-  console.log(`📨 Received job: ${job.submissionId}`);
-
-  await processSubmission(job);
+  // Route job by type
+  if (job.type === 'admin-execute') {
+    console.log(`📨 Received admin execution job`);
+    await executeAdminCode(job);
+  } else {
+    // Regular submission processing
+    console.log(`📨 Received submission job: ${job.submissionId}`);
+    await processSubmission(job);
+  }
 }
 
 /**
@@ -247,4 +359,4 @@ async function startWorker() {
 
 startWorker();
 
-export { processSubmission, handleMessage };
+export { processSubmission, handleMessage, executeAdminCode };

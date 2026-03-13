@@ -5,4 +5,5 @@ COPY package.json .
 RUN npm install
 COPY . .
 
-CMD ["npm","start"]
+# Run with nodemon in development, regular npm start in production
+CMD if [ "$NODE_ENV" = "development" ]; then npm run dev; else npm start; fi

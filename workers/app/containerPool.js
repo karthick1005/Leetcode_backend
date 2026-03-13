@@ -22,46 +22,61 @@ class ContainerPool {
   }
 
   /**
-   * Clean up orphaned containers from previous worker instances
+   * Reuse existing healthy containers from previous pool instances
    */
-  async cleanupOrphanedContainers() {
-    console.log('🧹 Cleaning up orphaned containers from previous runs...');
+  async reuseExistingContainers() {
+    console.log('♻️  Checking for existing containers to reuse...');
     
     try {
       const containers = await docker.listContainers({ all: true });
-      const orphanedContainers = containers.filter((c) => {
+      const pooledContainers = containers.filter((c) => {
         const labels = c.Labels || {};
         return labels.judge === 'true' && labels.pool === 'true';
       });
 
-      if (orphanedContainers.length > 0) {
-        console.log(`   Found ${orphanedContainers.length} orphaned container(s), cleaning up...`);
-        
-        for (const containerInfo of orphanedContainers) {
-          try {
-            const container = docker.getContainer(containerInfo.Id);
-            
-            // Stop container if running
-            if (containerInfo.State === 'running') {
-              await container.stop({ t: 3 });
-              console.log(`   ⏹️  Stopped: ${containerInfo.Names[0]}`);
-            }
-            
-            // Remove container
-            await container.remove({ force: true });
-            console.log(`   🗑️  Removed: ${containerInfo.Names[0]}`);
-          } catch (error) {
-            console.error(`   ⚠️  Failed to remove ${containerInfo.Names[0]}: ${error.message}`);
-          }
-        }
-        
-        console.log('✅ Orphaned container cleanup complete');
-      } else {
-        console.log('   ℹ️  No orphaned containers found');
+      if (pooledContainers.length === 0) {
+        console.log('   No existing containers found, will create new pool');
+        return 0;
       }
+
+      console.log(`   Found ${pooledContainers.length} existing container(s), attempting to reuse...`);
+      
+      let reusedCount = 0;
+      for (const containerInfo of pooledContainers) {
+        try {
+          const container = docker.getContainer(containerInfo.Id);
+          
+          // Start container if stopped
+          if (containerInfo.State !== 'running') {
+            await container.start();
+            console.log(`   🔄 Restarted: ${containerInfo.Names[0]}`);
+          } else {
+            console.log(`   ✅ Reusing: ${containerInfo.Names[0]}`);
+          }
+          
+          // Verify health
+          const isHealthy = await this.checkContainerHealth(container);
+          if (isHealthy) {
+            this.containers.push(container);
+            this.availableContainers.push(container);
+            reusedCount++;
+          } else {
+            console.log(`   ⚠️  Container ${containerInfo.Names[0]} is unhealthy, removing...`);
+            await container.stop({ t: 3 });
+            await container.remove({ force: true });
+          }
+        } catch (error) {
+          console.error(`   ⚠️  Failed to reuse ${containerInfo.Names[0]}: ${error.message}`);
+        }
+      }
+      
+      if (reusedCount > 0) {
+        console.log(`✅ Reused ${reusedCount} existing container(s)`);
+      }
+      return reusedCount;
     } catch (error) {
-      console.error('Error during orphaned container cleanup:', error.message);
-      // Don't fail initialization if cleanup fails
+      console.error('Error during container reuse:', error.message);
+      return 0;
     }
   }
 
@@ -72,21 +87,25 @@ class ContainerPool {
     console.log(`🚀 Initializing container pool with ${this.poolSize} containers...`);
 
     try {
-      // Clean up orphaned containers first
-      await this.cleanupOrphanedContainers();
+      // Try to reuse existing containers first
+      const reusedCount = await this.reuseExistingContainers();
 
       // Ensure image exists
       await this.ensureImage();
 
-      // Create containers
-      for (let i = 0; i < this.poolSize; i++) {
-        try {
-          const container = await this.createContainer();
-          this.containers.push(container);
-          this.availableContainers.push(container);
-          console.log(`  ✓ Container ${i + 1}/${this.poolSize} ready`);
-        } catch (error) {
-          console.error(`  ✗ Failed to create container ${i + 1}:`, error.message);
+      // Create additional containers if needed
+      const containersNeeded = this.poolSize - reusedCount;
+      if (containersNeeded > 0) {
+        console.log(`📦 Creating ${containersNeeded} new container(s)...`);
+        for (let i = 0; i < containersNeeded; i++) {
+          try {
+            const container = await this.createContainer();
+            this.containers.push(container);
+            this.availableContainers.push(container);
+            console.log(`  ✓ Container ${reusedCount + i + 1}/${this.poolSize} ready`);
+          } catch (error) {
+            console.error(`  ✗ Failed to create container ${reusedCount + i + 1}:`, error.message);
+          }
         }
       }
 
