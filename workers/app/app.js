@@ -142,7 +142,8 @@ async function executeAdminCode(job) {
       totalTime: Number(totalTime),
       timestamp: new Date().toISOString(),
       jobId,
-      result
+      result,
+      testcases:result.testcases
     };
 
     // Validate result before caching

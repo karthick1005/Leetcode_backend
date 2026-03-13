@@ -449,11 +449,11 @@ app.put('/api/problems/:problemId', async (req, res) => {
       doc(db, 'problem', problemId),
       {
         Adminsrc,
-        // Inputname,
-        // Remaining,
-        // // Testcases,
-        // Timeout,
-        // updatedAt: new Date(),
+        Inputname,
+        Remaining,
+        Testcases,
+        Timeout,
+        updatedAt: new Date(),
       },
       { merge: true }
     );
