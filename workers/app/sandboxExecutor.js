@@ -45,6 +45,25 @@ const compileCache = new Map();
 // ============= HELPER FUNCTIONS =============
 
 /**
+ * Get memory usage of a Docker container
+ */
+async function getContainerMemoryUsage(container) {
+  try {
+    // Get container stats - memory_stats.usage gives current memory in bytes
+    const stats = await container.stats({ stream: false });
+    if (stats && stats.memory_stats && stats.memory_stats.usage) {
+      const memoryBytes = stats.memory_stats.usage;
+      const memoryMB = Math.round((memoryBytes / 1024 / 1024) * 10) / 10; // Round to 1 decimal
+      return memoryMB;
+    }
+  } catch (error) {
+    console.log(`  ⚠️  Could not get actual memory stats: ${error.message}`);
+  }
+  // Fallback to estimate if stats unavailable
+  return 45; // Reasonable estimate for Node.js process
+}
+
+/**
  * Generate cache key for compiled code
  */
 function getCacheKey(code, lang) {
@@ -385,8 +404,10 @@ export async function executeCode(payload) {
     // Step 3: Execute test cases sequentially - stop on first runtime error
     console.log(`[${submissionId}] 🧪 Executing ${processedTestcases.length} test case(s) in container ${containerId}...`);
 
+    const executionStartTime = Date.now(); // Track when tests start executing
     const results = [];
     let shouldStop = false;
+    let totalExecutionTime = 0; // Track total execution time
 
     for (let index = 0; index < processedTestcases.length; index++) {
       const testcase = processedTestcases[index];
@@ -394,14 +415,7 @@ export async function executeCode(payload) {
       // Stop execution if runtime error occurred in previous test
       if (shouldStop) {
         console.log(`[${submissionId}] ⏹️  Stopping execution due to runtime error in test case ${index}`);
-        // results.push({
-        //   input: '',
-        //   output: '',
-        //   expected: '',
-        //   passed: false,
-        //   status: 'Skipped',
-        //   error: 'Execution stopped due to runtime error in previous test case',
-        // });
+        // Skip remaining tests without executing them
         continue;
       }
 
@@ -437,6 +451,9 @@ export async function executeCode(payload) {
           console.warn(`[${submissionId}] Warning: Failed to create input file: ${e.message}`);
         }
         
+        // Record execution time for this test
+        const testStartTime = Date.now();
+        
         // Execute with stdin from file (don't pass input parameter - let shell handle it)
         const result = await executeInContainer(
           container,
@@ -444,6 +461,10 @@ export async function executeCode(payload) {
           null,  // null instead of input - shell handles the redirection
           execTimeout
         );
+
+        const testEndTime = Date.now();
+        const testExecutionTime = testEndTime - testStartTime;
+        totalExecutionTime = testEndTime - executionStartTime; // Total time from start of execution
 
         // Extract marked output (between __START_USER_OUTPUT__ and __END_USER_OUTPUT__)
         const fullStdout = Buffer.from(result.stdout).toString("utf8");
@@ -477,7 +498,7 @@ export async function executeCode(payload) {
           console.log(`[${submissionId}] 📥 STDERR: "${result.stderr.trim()}"`);
         }
         console.log(`[${submissionId}] 🎯 Expected: "${expected}"`);
-        console.log(`[${submissionId}] ${passed && !runtimeError ? '✅' : '❌'} Test case ${index + 1}: ${status}`);
+        console.log(`[${submissionId}] ${passed && !runtimeError ? '✅' : '❌'} Test case ${index + 1}: ${status} (${testExecutionTime}ms)`);
 
         results.push({
           input: input.substring(0, 100), // Truncate for display
@@ -486,6 +507,7 @@ export async function executeCode(payload) {
           passed,
           status,
           logs: logs, // Include logs for debugging
+          runtime: testExecutionTime, // Add runtime for this test
           ...runtimeError, // Include runtime error if exists
         });
       } catch (error) {
@@ -497,44 +519,66 @@ export async function executeCode(payload) {
           expected = String(testcase?.expected || '').trim();
         }
         
-        console.log(`[${submissionId}] ❌ Test case ${index + 1}: Runtime Error - ${error.message}`);
+        // Check if error is a timeout
+        const isTimeout = error.message.includes('Timeout');
+        const status = isTimeout ? 'Time Limit Exceeded' : 'Runtime Error';
+        
+        console.log(`[${submissionId}] ❌ Test case ${index + 1}: ${status} - ${error.message}`);
         const errorDetails = extractFirstError(error.message);
         
-        results.push({
+        const resultObj = {
           input: input,
           output: '',
           expected: expected,
           passed: false,
-          status: 'Runtime Error',
+          status,
           error: error.message,
-          runtime_error: errorDetails.short,
-          full_runtime_error: errorDetails.full,
-        });
+        };
         
-        shouldStop = true; // Stop execution on runtime error
+        // Add error details based on type
+        if (isTimeout) {
+          resultObj.timeout_error = errorDetails.short;
+          resultObj.full_timeout_error = errorDetails.full;
+        } else {
+          resultObj.runtime_error = errorDetails.short;
+          resultObj.full_runtime_error = errorDetails.full;
+        }
+        
+        results.push(resultObj);
+        shouldStop = true; // Stop execution on timeout or runtime error
       }
     }
 
     // Determine overall status
     const allPassed = results.every((r) => r.passed);
-    const hasError = results.some((r) => r.status === 'Runtime Error');
+    const hasTimeoutError = results.some((r) => r.status === 'Time Limit Exceeded');
+    const hasRuntimeError = results.some((r) => r.status === 'Runtime Error');
+    const hasError = hasTimeoutError || hasRuntimeError;
     const hasWrongAnswer = results.some((r) => r.status === 'Wrong Answer');
 
     let statusMsg = 'Accepted';
-    if (hasError) statusMsg = 'Runtime Error';
+    if (hasTimeoutError) statusMsg = 'Time Limit Exceeded';
+    else if (hasRuntimeError) statusMsg = 'Runtime Error';
     else if (hasWrongAnswer) statusMsg = 'Wrong Answer';
 
     // Extract first error if exists
-    const firstErrorResult = results.find((r) => r.runtime_error || r.full_runtime_error);
+    const firstErrorResult = results.find((r) => r.runtime_error || r.full_runtime_error || r.timeout_error || r.full_timeout_error);
 
     const totalCorrect = results.filter((r) => r.passed).length;
     const totalTestcases = results.length;
     const compareResult = results.map((r) => r.passed ? '1' : '0').join('');
 
-    const endTime = Date.now();
-    const elapsedTime = endTime - Date.now(); // In real scenario would be from start
-    const memoryKB = 42004000; // Placeholder
-    const statusMemory = Math.round(memoryKB / 1024 / 1024) + ' MB';
+    // Calculate runtime and memory metrics like LeetCode
+    const executionEndTime = Date.now();
+    const actualRuntimeMs = executionEndTime - executionStartTime; // Total execution time in milliseconds
+    
+    // Get actual memory usage from Docker container (in MB)
+    let estimatedMemoryMB = await getContainerMemoryUsage(container);
+
+    // Format like LeetCode
+    const statusRuntimeMs = hasError ? 0 : actualRuntimeMs; // 0ms if error, otherwise actual
+    const statusRuntimeFormatted = hasError ? 'N/A' : `${Math.max(1, actualRuntimeMs)} ms`; // Min 1ms display
+    const statusMemory = `${estimatedMemoryMB} MB`;
 
     // LeetCode-style response format
     const leetcodeResponse = {
@@ -545,18 +589,22 @@ export async function executeCode(payload) {
       status_code: hasError ? -1 : (allPassed ? 10 : 11), // 10=Accepted, 11=Wrong Answer, -1=Error
       lang: lang,
       run_success: !hasError,
-      status_runtime: hasError ? 'N/A' : '0 ms',
-      memory: memoryKB,
-      display_runtime: '0',
+      status_runtime: statusRuntimeFormatted,
+      memory: estimatedMemoryMB * 1024 * 1024, // Convert to bytes
+      display_runtime: `${Math.max(1, actualRuntimeMs)}`,
       code_answer: results.map((r) => r.output),
       code_output: [],
       std_output_list: results.map((r) => r.logs),
-      elapsed_time: elapsedTime,
-      task_finish_time: endTime,
+      elapsed_time: actualRuntimeMs,
+      task_finish_time: executionEndTime,
       task_name: 'judger.runcodetask.RunCode',
 
       // Error details (if any)
-      ...(firstErrorResult && {
+      ...(firstErrorResult && firstErrorResult.timeout_error && {
+        timeout_error: firstErrorResult.timeout_error,
+        full_timeout_error: firstErrorResult.full_timeout_error,
+      }),
+      ...(firstErrorResult && firstErrorResult.runtime_error && {
         runtime_error: firstErrorResult.runtime_error,
         full_runtime_error: firstErrorResult.full_runtime_error,
       }),
@@ -586,7 +634,7 @@ export async function executeCode(payload) {
       pretty_lang: lang.charAt(0).toUpperCase() + lang.slice(1),
       submission_id: submissionId,
       status_msg: statusMsg,
-      state: allPassed ? 'SUCCESS' : (hasError ? 'RUNTIME_ERROR' : 'WRONG_ANSWER'),
+      state: allPassed ? 'SUCCESS' : (hasTimeoutError ? 'TIME_LIMIT_EXCEEDED' : (hasRuntimeError ? 'RUNTIME_ERROR' : 'WRONG_ANSWER')),
       
       // Detailed results for debugging
       testcases: results,
