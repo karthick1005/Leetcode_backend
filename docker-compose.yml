@@ -93,7 +93,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '4'
+          cpus: '3'
           memory: 2G
         reservations:
           cpus: '2'

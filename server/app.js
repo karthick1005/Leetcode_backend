@@ -138,7 +138,7 @@ const groupTestcases = (testcases, n = 1) =>
   Array.from({ length: Math.ceil(testcases.length / n) }, (_, i) =>
     testcases.slice(i * n, i * n + n).join("\n")
   );
-app.post('/submit', async (req, res) => {
+app.post('/interpret_solution', async (req, res) => {
   try {
     const { problemId, code, language, userId, testcases = [], quesId } = req.body;
 
@@ -230,7 +230,89 @@ app.post('/submit', async (req, res) => {
     res.status(500).json(errorResponse(500, 'Submission failed'));
   }
 });
+app.post('/submit', async (req, res) => {
+  try {
+    const { problemId, code, language, userId, testcases = [], quesId } = req.body;
 
+    // Validation
+    if (!problemId || !code || !language || !userId) {
+      return res.status(400).json(errorResponse(400, 'Missing required fields'));
+    }
+
+    // Generate submission ID
+    const submissionId = `Sumbit_${userId}-${problemId}-${uuidv4()}`;
+
+    console.log(`📝 New submission: ${submissionId}`);
+    
+    // Fetch problem details from Firestore (just code templates, admin code execution moves to worker)
+    let adminCode = null;
+    let remainingCode = null;
+    let groupedTestcases = [];
+    try {
+      const docSnap = await getDoc(doc(db, 'problem', quesId));
+      if (docSnap.exists()) {
+        const problemData = docSnap.data();
+        groupedTestcases=problemData.Testcases || [];
+        remainingCode = atob(problemData.Remaining[language] || '');
+      
+
+        console.log(`✅ Loaded admin code and remaining code for ${language}`);
+      } else {
+        return res.status(404).json(errorResponse(404, 'Problem not found'));
+      }
+    } catch (error) {
+      console.error('Failed to fetch problem from Firestore:', error);
+      return res.status(500).json(errorResponse(500, 'Failed to load problem'));
+    }
+
+    // Merge user code into remaining code
+    const mergedCode = remainingCode.replace('// INSERT_CODE_HERE', code);
+
+    // Prepare job for worker
+    // Testcases contain only inputs - worker will execute admin code to get expected outputs
+    const job = {
+      submissionId,
+      problemId,
+      userId,
+      code: mergedCode,
+      language,
+      testcases: groupedTestcases,  // Raw inputs only
+      submittedAt: new Date().toISOString(),
+    };
+
+    // Save to Firestore
+    try {
+      await setDoc(doc(db, 'submissions', submissionId), {
+        ...job,
+        status: 'queued',
+        createdAt: new Date(),
+      });
+    } catch (error) {
+      console.warn('Firestore save failed:', error.message);
+    }
+
+
+    // Set initial status in Redis with short TTL (5 min)
+    await setInRedis(`submission:${submissionId}:status`, 'queued', 300);
+
+    // Send to RabbitMQ queue
+    await sendMessage(job);
+
+    console.log(`📤 Sent to queue: ${submissionId} with ${testcases.length} testcases`);
+
+    // Return submission ID
+    res.status(202).json(
+      successResponse({
+        submissionId,
+        statusUrl: `/submissions/${submissionId}`,
+        websocketUrl: `ws://${req.get('host')}/ws`,
+      })
+    );
+  } catch (error) {
+    console.error('Submission error:', error);
+    res.status(500).json(errorResponse(500, 'Submission failed'));
+  }
+});
 /**
  * Get submission results
  * GET /submissions/:submissionId

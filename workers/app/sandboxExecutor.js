@@ -331,7 +331,7 @@ export async function executeCode(payload) {
       await getPool().release(adminContainer);
     }
   }
-
+  const sumbitcoode=submissionId.startsWith("Sumbit_");
   const container = await getPool().acquire();
   const containerId = container.id ? container.id.substring(0, 12) : "unknown";
   console.log(`[${submissionId}] 🐳 Acquired container: ${containerId}`);
@@ -382,8 +382,8 @@ export async function executeCode(payload) {
             null,
             10000, // 10s compile timeout
           );
-
-          if (compileResult.stdout.includes("error")) {
+          console.log("this is compile result",compileResult)
+          if (compileResult.stdout.includes("error") || compileResult.stderr.length>=1) {
             console.log(
               `[${submissionId}] ❌ Compilation error in container ${containerId}`,
             );
@@ -589,6 +589,10 @@ export async function executeCode(payload) {
           runtime: testExecutionTime, // Add runtime for this test
           ...runtimeError, // Include runtime error if exists
         });
+        if(sumbitcoode && !passed)
+        {
+          shouldStop = true; // Stop after first test case for "Run Code" submissions
+        }
       } catch (error) {
         // Safely get input from testcase
         let input = "";
@@ -702,6 +706,7 @@ export async function executeCode(payload) {
           full_runtime_error: firstErrorResult.full_runtime_error,
         }),
 
+      lasttestcase:results[results.length-1] || [],
       // Expected output (from admin code)
       expected_status_code: 10, // Expected always runs successfully
       expected_lang: "python", // Admin code language
